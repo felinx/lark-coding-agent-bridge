@@ -58,8 +58,11 @@ const CLAUDE_FALLBACK_MODELS: ModelOption[] = [
   { value: 'opusplan', label: 'Opus Plan（规划用 Opus，执行用 Sonnet）' },
 ];
 
-/** Codex CLI models. Forwarded to `codex exec --model`. */
-const CODEX_MODELS: ModelOption[] = [
+/**
+ * Used only when the Codex model catalog written by the provider switcher is
+ * missing. Forwarded to `codex exec --model`.
+ */
+const CODEX_FALLBACK_MODELS: ModelOption[] = [
   { value: DEFAULT_MODEL, label: '跟随默认（不指定）' },
   { value: 'gpt-5-codex', label: 'GPT-5 Codex' },
   { value: 'gpt-5', label: 'GPT-5' },
@@ -116,7 +119,40 @@ function claudeModels(): ModelOption[] {
 
 /** The model picker options for a profile's agent kind. */
 export function supportedModels(agentKind: AgentKind): ModelOption[] {
-  return agentKind === 'codex' ? CODEX_MODELS : claudeModels();
+  return agentKind === 'codex' ? codexModels() : claudeModels();
+}
+
+/**
+ * Read the Codex model catalog written by the provider switcher
+ * (`~/.codex/cc-switch-model-catalog.json`, shape `{ models: [{ slug,
+ * display_name, description }] }`). Codex and Claude mappings are separate:
+ * this never reads the Claude settings file.
+ */
+export function readCodexCatalog(): ModelOption[] {
+  try {
+    const catalog = JSON.parse(
+      readFileSync(join(homedir(), '.codex', 'cc-switch-model-catalog.json'), 'utf8'),
+    ) as { models?: Array<{ slug?: string; display_name?: string; description?: string }> };
+    const seen = new Set<string>([DEFAULT_MODEL]);
+    const out: ModelOption[] = [];
+    for (const m of catalog.models ?? []) {
+      const value = m.slug;
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      const label = m.display_name || value;
+      const desc = m.description && m.description !== label ? m.description : '';
+      out.push({ value, label, ...(desc ? { desc } : {}) });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function codexModels(): ModelOption[] {
+  const catalog = readCodexCatalog();
+  if (catalog.length === 0) return CODEX_FALLBACK_MODELS;
+  return [{ value: DEFAULT_MODEL, label: '跟随默认（不指定）' }, ...catalog];
 }
 
 /** True when the selection means "use the agent default" (no `--model`). */

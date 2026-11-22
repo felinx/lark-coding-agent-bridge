@@ -8,6 +8,7 @@ import {
   modelLabel,
   normalizeModelSelection,
   readCliModelMappings,
+  readCodexCatalog,
   resolveModelArg,
   supportedModels,
 } from '../../../src/agent/models.js';
@@ -77,6 +78,31 @@ describe('agent model catalog', () => {
     expect(readCliModelMappings()).toEqual([
       { alias: 'sonnet', id: 'claude-sonnet-5', name: 'claude-sonnet-5', desc: '' },
     ]);
+  });
+
+  it('reads the Codex catalog from ~/.codex, separate from the Claude mapping', () => {
+    writeSettings(MAPPED_ENV);
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    writeFileSync(
+      join(home, '.codex', 'cc-switch-model-catalog.json'),
+      JSON.stringify({
+        models: [
+          { slug: 'codex-model-a', display_name: 'Codex Model A', description: 'Codex Model A' },
+          { slug: 'codex-model-b', display_name: 'codex-model-b', description: 'Second model' },
+        ],
+      }),
+    );
+    expect(readCodexCatalog().map((m) => m.value)).toEqual(['codex-model-a', 'codex-model-b']);
+    const codex = supportedModels('codex');
+    expect(codex.map((m) => m.value)).toEqual([DEFAULT_MODEL, 'codex-model-a', 'codex-model-b']);
+    expect(codex[2]?.desc).toBe('Second model');
+    // Claude options never leak into the Codex list.
+    expect(codex.map((m) => m.value)).not.toContain('deepseek-v4.1-flash');
+  });
+
+  it('falls back to the static Codex models when the catalog is missing', () => {
+    writeSettings(undefined);
+    expect(supportedModels('codex').map((m) => m.value)).toContain('gpt-5-codex');
   });
 
   it('offers a distinct catalog per agent kind, each led by the default sentinel', () => {

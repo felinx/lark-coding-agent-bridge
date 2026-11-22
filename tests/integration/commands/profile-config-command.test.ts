@@ -92,25 +92,73 @@ describe('profile-aware account and config commands', () => {
 
   it('persists the picked model and clears it when "default" is chosen', async () => {
     vi.useFakeTimers();
-    const h = await createHarness();
-
-    await h.command('/config submit', {
-      model: 'claude-opus-4-8',
-      message_reply: 'text',
-    });
-    const withModel = await waitForRoot(h.rootDir, (candidate) =>
-      candidate.profiles.claude?.preferences.model === 'claude-opus-4-8',
+    // The model picker reads the provider mapping from ~/.claude/settings.json,
+    // so point HOME at a temp dir that maps a known model name.
+    const fakeHome = await mkdtemp(join(tmpdir(), 'config-model-home-'));
+    await mkdir(join(fakeHome, '.claude'), { recursive: true });
+    await writeFile(
+      join(fakeHome, '.claude', 'settings.json'),
+      JSON.stringify({ env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5[1M]', ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'test-model-a' } }),
     );
-    expect(withModel.profiles.claude?.preferences.model).toBe('claude-opus-4-8');
+    const savedHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const h = await createHarness();
 
-    await h.command('/config submit', {
-      model: 'default',
-      message_reply: 'text',
-    });
-    const cleared = await waitForRoot(h.rootDir, (candidate) =>
-      candidate.profiles.claude?.preferences.model === undefined,
+      await h.command('/config submit', {
+        model: 'test-model-a',
+        message_reply: 'text',
+      });
+      const withModel = await waitForRoot(h.rootDir, (candidate) =>
+        candidate.profiles.claude?.preferences.model === 'test-model-a',
+      );
+      expect(withModel.profiles.claude?.preferences.model).toBe('test-model-a');
+
+      await h.command('/config submit', {
+        model: 'default',
+        message_reply: 'text',
+      });
+      const cleared = await waitForRoot(h.rootDir, (candidate) =>
+        candidate.profiles.claude?.preferences.model === undefined,
+      );
+      expect(cleared.profiles.claude?.preferences.model).toBeUndefined();
+    } finally {
+      process.env.HOME = savedHome;
+      await rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it('/model sends the picker card and "/model use <id>" persists the choice', async () => {
+    vi.useFakeTimers();
+    const fakeHome = await mkdtemp(join(tmpdir(), 'model-cmd-home-'));
+    await mkdir(join(fakeHome, '.claude'), { recursive: true });
+    await writeFile(
+      join(fakeHome, '.claude', 'settings.json'),
+      JSON.stringify({ env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5[1M]', ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'test-model-b' } }),
     );
-    expect(cleared.profiles.claude?.preferences.model).toBeUndefined();
+    const savedHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const h = await createHarness();
+
+      await h.command('/model');
+      const card = JSON.stringify(h.channel.sent.at(-1)?.content);
+      expect(card).toContain('test-model-b');
+      expect(card).toContain('model.use');
+
+      await h.command('/model use test-model-b');
+      const saved = await waitForRoot(h.rootDir, (candidate) =>
+        candidate.profiles.claude?.preferences.model === 'test-model-b',
+      );
+      expect(saved.profiles.claude?.preferences.model).toBe('test-model-b');
+
+      await h.command('/model use not-a-model');
+      const reply = JSON.stringify(h.channel.sent.at(-1)?.content);
+      expect(reply).toContain('未知模型');
+    } finally {
+      process.env.HOME = savedHome;
+      await rm(fakeHome, { recursive: true, force: true });
+    }
   });
 
   it('keeps the current message reply mode when the config submit payload omits it', async () => {

@@ -1,3 +1,5 @@
+import type { ModelOption } from '../agent/models';
+
 interface ButtonSpec {
   text: string;
   value: Record<string, unknown>;
@@ -59,6 +61,34 @@ export function workspacesCard(current: string | undefined, named: Record<string
   }
 
   return shell('📂 工作目录', elements);
+}
+
+/**
+ * `/model` picker. Each option is a button whose payload `{cmd:'model.use',
+ * arg}` is routed by the card dispatcher to `/model use <arg>`.
+ */
+export function modelCard(current: string, options: ModelOption[]): object {
+  const currentOpt = options.find((o) => o.value === current);
+  const elements: object[] = [
+    divMd(`当前：**${escapeMd(currentOpt?.label ?? current)}**`),
+    HR,
+  ];
+  for (const o of options) {
+    const isCurrent = o.value === current;
+    const text = `${isCurrent ? '✓ ' : ''}${o.desc ? `${o.label}  ${o.desc}` : o.label}`;
+    elements.push(
+      actions([
+        {
+          text,
+          value: { cmd: 'model.use', arg: o.value },
+          style: isCurrent ? 'primary' : 'default',
+        },
+      ]),
+    );
+  }
+  elements.push(HR);
+  elements.push(divMd('点选即可切换，下一条消息起生效；也可发送 `/model use <id>`。'));
+  return shell('🧠 模型', elements);
 }
 
 export interface StatusInfo {
@@ -191,6 +221,7 @@ export function helpCard(agentName = 'Agent'): object {
         '- `/ws list|save <name>|use <name>|remove <name>` — 工作目录',
         '- `/account` — 查看当前应用；`/account change` 换 appId/secret 并重连',
         '- `/config` — 调整偏好、访问控制和 lark-cli 身份策略',
+        '- `/model` — 切换模型（卡片点选；`/model use <id>` / `/model reset`）',
         '- `/status` — 当前状态',
         '- `/stop` — 结束当前正在跑的任务（也可点卡片底部 ⏹ 终止 按钮）',
         '- `/stop comment:<scopeHash>` — 管理员停止云文档评论任务',

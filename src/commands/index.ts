@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
-import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
+import { DEFAULT_MODEL, modelLabel, normalizeModelSelection, supportedModels } from '../agent/models';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -24,7 +24,7 @@ import {
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
-import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
+import { helpCard, modelCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -176,6 +176,7 @@ const handlers: Record<string, Handler> = {
   '/help': handleHelp,
   '/account': handleAccount,
   '/config': handleConfig,
+  '/model': handleModel,
   '/stop': handleStop,
   '/timeout': handleTimeout,
   '/ps': handlePs,
@@ -196,6 +197,7 @@ const handlers: Record<string, Handler> = {
 const ADMIN_COMMANDS = new Set([
   '/account',
   '/config',
+  '/model',
   '/ps',
   '/exit',
   '/reconnect',
@@ -807,6 +809,70 @@ async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' 
     return 'user-missing';
   }
   return 'app';
+}
+
+/** `/model` — pick the agent model. Card click arrives as `use <value>`. */
+async function handleModel(args: string, ctx: CommandContext): Promise<void> {
+  const agentKind = ctx.controls.profileConfig.agentKind;
+  const options = supportedModels(agentKind);
+  const current = normalizeModelSelection(agentKind, ctx.controls.cfg.preferences?.model);
+  const raw = args.trim().replace(/^use\s+/, '');
+
+  if (!raw) {
+    await sendManagedCard(
+      ctx.channel,
+      ctx.msg.chatId,
+      modelCard(current, options),
+      commandReplyOptions(ctx),
+    );
+    return;
+  }
+  if (raw === 'list') {
+    await reply(
+      ctx,
+      [
+        `当前模型：**${modelLabel(agentKind, current)}**`,
+        '可用：',
+        ...options.map((o) => `- \`${o.value}\`${o.desc ? ` — ${o.desc}` : ''}`),
+        '`/model reset` 恢复默认',
+      ].join('\n'),
+    );
+    return;
+  }
+
+  const target = raw === 'reset' || raw === 'default' ? DEFAULT_MODEL : raw;
+  const match = options.find((o) => o.value === target);
+  if (!match) {
+    await reply(
+      ctx,
+      `未知模型：\`${target}\`\n可用：${options.map((o) => `\`${o.value}\``).join(' / ')}`,
+    );
+    return;
+  }
+
+  const nextPreferences: AppPreferences = {
+    ...(ctx.controls.cfg.preferences ?? {}),
+    model: match.value === DEFAULT_MODEL ? undefined : match.value,
+  };
+  try {
+    await savePreferencesConfig(
+      ctx,
+      nextPreferences,
+      getRequireMentionInGroup(ctx.controls.cfg),
+      ctx.controls.profileConfig.larkCli.identityPreset,
+      ctx.controls.profileConfig.mode,
+    );
+  } catch (err) {
+    log.fail('command', err, { step: 'model.save' });
+    await reply(ctx, `切换失败：${String(err instanceof Error ? err.message : err)}`);
+    return;
+  }
+  await reply(
+    ctx,
+    match.value === DEFAULT_MODEL
+      ? '✅ 已恢复默认模型，下一条消息生效。'
+      : `✅ 已切换为 **${modelLabel(agentKind, match.value)}**（\`${match.value}\`），下一条消息生效。`,
+  );
 }
 
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {

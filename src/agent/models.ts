@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { AgentKind } from '../config/profile-schema';
 
 /**
@@ -14,24 +17,44 @@ export interface ModelOption {
    * flag. `DEFAULT_MODEL` is special-cased to omit the flag entirely.
    */
   value: string;
-  /** Human-facing label shown in the `/config` picker. */
+  /** Human-facing label shown in the `/config` picker and `/model` card. */
   label: string;
+  /** Optional one-line description (e.g. the provider behind the model). */
+  desc?: string;
+}
+
+/** One Claude Code model slot as configured by the provider switcher. */
+export interface CliModelMapping {
+  /** Claude Code alias this slot answers to: opus / fable / sonnet / haiku. */
+  alias: string;
+  /** Underlying model id, e.g. `claude-opus-5[1M]`. */
+  id: string;
+  /** Display name the CLI `/model` list shows, e.g. `deepseek-v4.1-flash`. */
+  name: string;
+  desc: string;
 }
 
 /**
- * Claude Code models. Pinned to concrete version ids (Claude Code's `--model`
- * accepts the full model-id string, not just the `opus`/`sonnet` aliases) so
- * the picker names an exact model. Add new ids here when a generation ships;
- * `opusplan` is kept as the one alias with no versioned equivalent (it runs
- * Opus for planning and Sonnet for execution).
+ * Order matches the Claude Code `/model` picker so the bridge card lists
+ * models in the same sequence the user sees in the terminal.
  */
-const CLAUDE_MODELS: ModelOption[] = [
+const CLAUDE_SLOTS: ReadonlyArray<readonly [alias: string, envKey: string]> = [
+  ['opus', 'OPUS'],
+  ['fable', 'FABLE'],
+  ['sonnet', 'SONNET'],
+  ['haiku', 'HAIKU'],
+];
+
+/**
+ * Used only when `~/.claude/settings.json` carries no provider mapping (plain
+ * Anthropic account). These aliases are resolved by the Claude CLI itself.
+ */
+const CLAUDE_FALLBACK_MODELS: ModelOption[] = [
   { value: DEFAULT_MODEL, label: '跟随默认（不指定）' },
-  { value: 'claude-opus-4-8', label: 'Opus 4.8（最新）' },
-  { value: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { value: 'claude-sonnet-5', label: 'Sonnet 5（最新）' },
-  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { value: 'claude-haiku-4-5', label: 'Haiku 4.5（最新）' },
+  { value: 'fable', label: 'Fable（最新）' },
+  { value: 'opus', label: 'Opus（最新）' },
+  { value: 'sonnet', label: 'Sonnet（最新）' },
+  { value: 'haiku', label: 'Haiku（最新）' },
   { value: 'opusplan', label: 'Opus Plan（规划用 Opus，执行用 Sonnet）' },
 ];
 
@@ -43,9 +66,57 @@ const CODEX_MODELS: ModelOption[] = [
   { value: 'o3', label: 'o3' },
 ];
 
+/**
+ * Read the model slots the Claude CLI shows in `/model`. These come from the
+ * `ANTHROPIC_DEFAULT_<SLOT>_MODEL[_NAME|_DESCRIPTION]` env block that the
+ * provider switcher (e.g. CC Switch) writes into `~/.claude/settings.json`.
+ * Read on every call so a provider switch takes effect without a restart.
+ */
+export function readCliModelMappings(): CliModelMapping[] {
+  try {
+    const settings = JSON.parse(
+      readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'),
+    ) as { env?: Record<string, string> };
+    const env = settings.env ?? {};
+    const out: CliModelMapping[] = [];
+    for (const [alias, key] of CLAUDE_SLOTS) {
+      const id = env[`ANTHROPIC_DEFAULT_${key}_MODEL`];
+      if (!id) continue;
+      out.push({
+        alias,
+        id,
+        name: env[`ANTHROPIC_DEFAULT_${key}_MODEL_NAME`] || id,
+        desc: env[`ANTHROPIC_DEFAULT_${key}_MODEL_DESCRIPTION`] || '',
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Claude picker options. Mirrors the CLI `/model` list: the mapped display
+ * names (which the provider proxy accepts as `--model` values) after a
+ * "follow default" entry. Falls back to the static aliases when no mapping
+ * exists.
+ */
+function claudeModels(): ModelOption[] {
+  const mapped = readCliModelMappings();
+  if (mapped.length === 0) return CLAUDE_FALLBACK_MODELS;
+  const seen = new Set<string>([DEFAULT_MODEL]);
+  const out: ModelOption[] = [{ value: DEFAULT_MODEL, label: '跟随默认（不指定）' }];
+  for (const m of mapped) {
+    if (seen.has(m.name)) continue;
+    seen.add(m.name);
+    out.push({ value: m.name, label: m.name, ...(m.desc ? { desc: m.desc } : {}) });
+  }
+  return out;
+}
+
 /** The model picker options for a profile's agent kind. */
 export function supportedModels(agentKind: AgentKind): ModelOption[] {
-  return agentKind === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+  return agentKind === 'codex' ? CODEX_MODELS : claudeModels();
 }
 
 /** True when the selection means "use the agent default" (no `--model`). */
@@ -57,8 +128,9 @@ export function isDefaultModel(value: string | undefined): boolean {
  * Coerce a stored model preference into a value guaranteed to be one of the
  * current agent's picker options — Feishu's `select_static` requires
  * `initial_option` to match an option value exactly. Unknown / cross-agent
- * values (e.g. a Claude alias left over after switching a profile to Codex)
- * fall back to {@link DEFAULT_MODEL}.
+ * values (e.g. a Claude alias left over after switching a profile to Codex,
+ * or a provider model that was removed from settings) fall back to
+ * {@link DEFAULT_MODEL}.
  */
 export function normalizeModelSelection(
   agentKind: AgentKind,

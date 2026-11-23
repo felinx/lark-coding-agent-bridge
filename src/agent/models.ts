@@ -123,12 +123,22 @@ export function supportedModels(agentKind: AgentKind): ModelOption[] {
 }
 
 /**
- * Read the Codex model catalog written by the provider switcher
- * (`~/.codex/cc-switch-model-catalog.json`, shape `{ models: [{ slug,
- * display_name, description }] }`). Codex and Claude mappings are separate:
- * this never reads the Claude settings file.
+ * True when `~/.codex/config.toml` routes Codex through a custom provider
+ * (the provider switcher's proxy). False means Codex talks to the official
+ * backend, where `models_cache.json` is authoritative.
  */
-export function readCodexCatalog(): ModelOption[] {
+function codexUsesCustomProvider(): boolean {
+  try {
+    const toml = readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf8');
+    const m = /^\s*model_provider\s*=\s*"([^"]+)"/m.exec(toml);
+    return Boolean(m && m[1] && m[1] !== 'openai');
+  } catch {
+    return false;
+  }
+}
+
+/** Proxy-mode catalog written by the provider switcher. */
+function readCodexProxyCatalog(): ModelOption[] {
   try {
     const catalog = JSON.parse(
       readFileSync(join(homedir(), '.codex', 'cc-switch-model-catalog.json'), 'utf8'),
@@ -147,6 +157,52 @@ export function readCodexCatalog(): ModelOption[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Official-mode catalog: the model list the Codex CLI itself fetched
+ * (`~/.codex/models_cache.json`). Entries flagged `visibility: "hide"` are
+ * internal and never shown in the CLI picker, so they are dropped here too.
+ */
+function readCodexOfficialCatalog(): ModelOption[] {
+  try {
+    const cache = JSON.parse(
+      readFileSync(join(homedir(), '.codex', 'models_cache.json'), 'utf8'),
+    ) as {
+      models?: Array<{
+        slug?: string;
+        display_name?: string;
+        description?: string;
+        visibility?: string;
+      }>;
+    };
+    const all = cache.models ?? [];
+    const visible = all.filter((m) => m.visibility !== 'hide');
+    const source = visible.length > 0 ? visible : all;
+    const seen = new Set<string>([DEFAULT_MODEL]);
+    const out: ModelOption[] = [];
+    for (const m of source) {
+      const value = m.slug;
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      const label = m.display_name || value;
+      const desc = m.description && m.description !== label ? m.description : '';
+      out.push({ value, label, ...(desc ? { desc } : {}) });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Codex model options, resolved against the mode Codex is currently
+ * configured for: proxy catalog when a custom provider is set, otherwise the
+ * official model cache. Read on every call so a provider switch shows up
+ * without restarting the bridge.
+ */
+export function readCodexCatalog(): ModelOption[] {
+  return codexUsesCustomProvider() ? readCodexProxyCatalog() : readCodexOfficialCatalog();
 }
 
 function codexModels(): ModelOption[] {

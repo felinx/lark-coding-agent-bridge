@@ -80,9 +80,13 @@ describe('agent model catalog', () => {
     ]);
   });
 
-  it('reads the Codex catalog from ~/.codex, separate from the Claude mapping', () => {
+  it('uses the proxy catalog when config.toml routes Codex through a custom provider', () => {
     writeSettings(MAPPED_ENV);
     mkdirSync(join(home, '.codex'), { recursive: true });
+    writeFileSync(
+      join(home, '.codex', 'config.toml'),
+      'model = "proxy-model"\nmodel_provider = "ccswitch"\n\n[model_providers.ccswitch]\nbase_url = "http://127.0.0.1:15721/v1"\n',
+    );
     writeFileSync(
       join(home, '.codex', 'cc-switch-model-catalog.json'),
       JSON.stringify({
@@ -100,7 +104,29 @@ describe('agent model catalog', () => {
     expect(codex.map((m) => m.value)).not.toContain('deepseek-v4.1-flash');
   });
 
-  it('falls back to the static Codex models when the catalog is missing', () => {
+  it('uses the official Codex cache when no custom provider is configured', () => {
+    writeSettings(undefined);
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    // Direct mode: no model_provider, and a stale proxy catalog on disk.
+    writeFileSync(join(home, '.codex', 'config.toml'), 'model = "gpt-6.2-sol"\n');
+    writeFileSync(
+      join(home, '.codex', 'cc-switch-model-catalog.json'),
+      JSON.stringify({ models: [{ slug: 'stale-proxy-model', display_name: 'Stale' }] }),
+    );
+    writeFileSync(
+      join(home, '.codex', 'models_cache.json'),
+      JSON.stringify({
+        models: [
+          { slug: 'gpt-6.2-sol', display_name: 'GPT-6.2-Sol', description: 'Go-to model.', visibility: 'list' },
+          { slug: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra', description: 'Most capable.', visibility: 'list' },
+          { slug: 'gpt-reserve', display_name: 'GPT-Reserve', description: 'Internal.', visibility: 'hide' },
+        ],
+      }),
+    );
+    expect(readCodexCatalog().map((m) => m.value)).toEqual(['gpt-6.2-sol', 'gpt-6.2-astra']);
+  });
+
+  it('falls back to the static Codex models when no catalog is available', () => {
     writeSettings(undefined);
     expect(supportedModels('codex').map((m) => m.value)).toContain('gpt-5-codex');
   });

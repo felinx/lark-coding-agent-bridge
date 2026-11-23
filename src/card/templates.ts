@@ -345,6 +345,7 @@ export function helpCard(agentName = 'Agent'): object {
         '- `/resume [N]` — 列出并恢复历史会话（最多 N 条）',
         '- `/sessions [N]` — 列出可接续的会话，点一行即可接续',
         '- `/sessions rm <id前缀>` — 删除一条历史会话（不可恢复）',
+        '- `/compact` — 压缩当前会话的上下文（会话不变，仅 Claude）',
         '- `/cd <path>` — 切换工作目录（会重置 session）',
         '- `/ws list|save <name>|use <name>|remove <name>` — 工作目录',
         '- `/account` — 查看当前应用；`/account change` 换 appId/secret 并重连',

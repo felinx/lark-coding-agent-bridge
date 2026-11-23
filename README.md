@@ -144,6 +144,8 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws use <name>` | Switch to a named workspace |
 | `/ws remove <name>` | Delete a named workspace |
 | `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
+| `/sessions [N]` | List resumable sessions (click a row to continue it); `/sessions rm <id prefix>` deletes one transcript |
+| `/compact` | Compact the current session's context in place (Claude only) |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
 | `/invite user @name` | Allow a user to use the bot in DMs |

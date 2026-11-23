@@ -174,6 +174,7 @@ const handlers: Record<string, Handler> = {
   '/ws': handleWs,
   '/resume': handleResume,
   '/sessions': handleSessions,
+  '/compact': handleCompact,
   '/status': handleStatus,
   '/help': handleHelp,
   '/account': handleAccount,
@@ -751,6 +752,138 @@ function forgetCatalogSession(catalog: SessionCatalog | undefined, sessionId: st
       catalog.remove(entry.key);
     }
   }
+}
+
+/** The prompt that makes the Claude CLI compact the resumed session in place. */
+const COMPACT_PROMPT = '/compact';
+
+/**
+ * `/compact` — shrink the current session's context without leaving it.
+ *
+ * Claude Code accepts `/compact` as a prompt in print mode: the CLI appends a
+ * compact boundary plus a summary to the resumed transcript and keeps the same
+ * session id, so the bridge only has to run that prompt against the pinned
+ * session. The run goes through the executor under the chat's own scope, so a
+ * message arriving mid-compaction queues behind it instead of racing the same
+ * transcript. Codex has no equivalent in exec mode.
+ */
+async function handleCompact(args: string, ctx: CommandContext): Promise<void> {
+  if (args.trim()) {
+    await reply(ctx, '用法：`/compact`（无需参数）。');
+    return;
+  }
+  if (ctx.controls.profileConfig.agentKind !== 'claude') {
+    await reply(ctx, 'Codex 会话暂不支持 `/compact`。');
+    return;
+  }
+  const stored = ctx.sessions.getRaw(ctx.scope);
+  if (!stored?.sessionId || !stored.cwd) {
+    await reply(ctx, '当前还没有会话；先发一条消息再压缩。');
+    return;
+  }
+  if (ctx.activeRuns.get(ctx.scope)) {
+    await reply(ctx, '当前还有任务在跑，等它结束或先 `/stop` 再压缩。');
+    return;
+  }
+  if (!ctx.runExecutor) {
+    await reply(ctx, '当前 profile 没有可用的运行执行器，无法压缩。');
+    return;
+  }
+  const requestedCwd = effectiveWorkspaceCwd(ctx);
+  if (!requestedCwd) {
+    await reply(ctx, '请先使用 `/cd <path>` 选择工作目录。');
+    return;
+  }
+  const workspace = await resolveWorkingDirectory(requestedCwd);
+  if (!workspace.ok) {
+    await reply(ctx, workspace.userVisible);
+    return;
+  }
+  if (stored.cwd !== workspace.cwdRealpath) {
+    await reply(ctx, '当前会话是在另一个目录下建立的；先 `/cd` 回该目录再压缩。');
+    return;
+  }
+
+  const capability = claudeCapability(ctx.controls.profileConfig);
+  const policy = evaluateRunPolicy({
+    scope: {
+      source: 'im',
+      chatId: ctx.msg.chatId,
+      actorId: ctx.msg.senderId,
+      ...(ctx.msg.threadId ? { threadId: ctx.msg.threadId } : {}),
+    },
+    attachments: [],
+    prompt: COMPACT_PROMPT,
+    requestedCwd,
+    cwdRealpath: workspace.cwdRealpath,
+    access: canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId),
+    capability,
+    profileConfig: ctx.controls.profileConfig,
+    now: Date.now(),
+    ttlMs: 60_000,
+  });
+  if (!policy.ok) {
+    await reply(ctx, policy.rejectReason.userVisible);
+    return;
+  }
+
+  let execution: Awaited<ReturnType<RunExecutor['submit']>>;
+  try {
+    execution = await ctx.runExecutor.submit({
+      scopeId: ctx.scope,
+      policy,
+      sessionId: stored.sessionId,
+      stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
+      nowait: true,
+      observability: {
+        profile: ctx.controls.profile,
+        agent: capability.agentId,
+        source: 'compact',
+        stage: 'agent-compact',
+      },
+    });
+  } catch (err) {
+    if (err instanceof RunRejected && err.code === 'pool-full') {
+      await reply(ctx, '当前并发已满，稍后再试。');
+      return;
+    }
+    log.fail('command', err, { step: 'compact.submit' });
+    reportMetric('command_fail', 1, { step: 'compact.submit' });
+    await reply(ctx, '压缩失败：无法启动压缩任务。');
+    return;
+  }
+
+  await reply(ctx, '🗜 正在压缩会话上下文…');
+
+  let text = '';
+  let failure: string | undefined;
+  try {
+    for await (const evt of execution.subscribe()) {
+      if (execution.handle.interrupted) break;
+      if (evt.type === 'text') text += evt.delta;
+      else if (evt.type === 'final_text') text = evt.content;
+      else if (evt.type === 'error') {
+        failure = evt.message;
+        break;
+      } else if (evt.type === 'done') break;
+    }
+  } catch (err) {
+    failure = err instanceof Error ? err.message : String(err);
+  }
+  if (execution.handle.interrupted) {
+    await reply(ctx, '已中断压缩。');
+    return;
+  }
+  if (failure) {
+    log.warn('command', 'compact-failed', { err: failure });
+    await reply(ctx, `压缩失败：${failure}`);
+    return;
+  }
+  const report = text.trim();
+  await reply(
+    ctx,
+    report ? `🗜 ${report}` : '✅ 会话上下文已压缩，下一条消息继续使用同一会话。',
+  );
 }
 
 async function handleResume(args: string, ctx: CommandContext): Promise<void> {

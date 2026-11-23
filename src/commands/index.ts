@@ -24,7 +24,8 @@ import {
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
-import { helpCard, modelCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
+import { helpCard, modelCard, resumeCard, sessionsCard, statusCard, workspacesCard } from '../card/templates';
+import type { SessionOverviewEntry } from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -61,7 +62,7 @@ import {
   reduce,
   type RunState,
 } from '../card/run-state';
-import { formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
+import { deleteSessionFile, formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
 import {
   listCodexThreadHistory,
   type CodexThreadHistoryEntry,
@@ -172,6 +173,7 @@ const handlers: Record<string, Handler> = {
   '/cd': handleCd,
   '/ws': handleWs,
   '/resume': handleResume,
+  '/sessions': handleSessions,
   '/status': handleStatus,
   '/help': handleHelp,
   '/account': handleAccount,
@@ -535,6 +537,222 @@ function listScopedWorkspaces(ctx: CommandContext): Record<string, string> {
   return scoped;
 }
 
+/**
+ * `/sessions [N]` — the sessions this conversation can continue, split into the
+ * ones this chat created (per the session catalog) and the rest of the recent
+ * sessions under the working directory. Every row but the active one carries a
+ * restore button whose payload is a one-time resume nonce, so switching
+ * sessions goes through the same path as `/resume`.
+ */
+async function handleSessions(args: string, ctx: CommandContext): Promise<void> {
+  const parsed = Number.parseInt(args.trim(), 10);
+  const limit = Number.isFinite(parsed) && parsed > 0 && parsed <= 20 ? parsed : 5;
+
+  const cwd = effectiveWorkspaceCwd(ctx);
+  if (!cwd) {
+    await reply(ctx, '请先使用 /cd <path> 选择工作目录，再查看会话。');
+    return;
+  }
+  if (ctx.chatMode !== 'p2p') {
+    await reply(ctx, '群聊中不展示会话详情。请私聊 bot 使用 `/sessions`。');
+    return;
+  }
+
+  const [sub = '', idArg = ''] = args.trim().split(/\s+/).filter(Boolean);
+  if (sub === 'rm' || sub === 'delete') {
+    return removeSession(idArg, ctx, cwd);
+  }
+
+  const agentKind = ctx.controls.profileConfig.agentKind;
+  const stored = ctx.sessions.getRaw(ctx.scope);
+  const identity = ctx.sessionCatalogIdentity;
+  const catalogEntry =
+    agentKind === 'codex' && ctx.sessionCatalog && identity
+      ? ctx.sessionCatalog.activeFor(identity)
+      : undefined;
+
+  const currentId = agentKind === 'codex' ? catalogEntry?.threadId : stored?.sessionId;
+  const updatedAt = agentKind === 'codex' ? catalogEntry?.updatedAt : stored?.updatedAt;
+
+  // Sessions on disk under this cwd, newest first — the source of previews and
+  // of the "其它来源" group.
+  const historyLimit = Math.max(limit, 20);
+  const history: SessionRow[] = dedupeSessionRows(
+    agentKind === 'codex'
+      ? (identity ? await listCodexResumeHistory(ctx, cwd, historyLimit) : []).map((thread) => ({
+          id: thread.threadId,
+          preview: thread.name || thread.preview,
+          updatedAt: thread.updatedAtMs,
+          detail: `Codex · ${thread.source}`,
+        }))
+      : (await listClaudeResumeHistory(ctx, cwd, historyLimit)).map((s) => ({
+          id: s.sessionId,
+          preview: s.preview,
+          updatedAt: s.mtime,
+          detail: `${s.lineCount} 条`,
+          ...(s.lastPreview ? { lastPreview: s.lastPreview } : {}),
+        })),
+  );
+  const onDisk = new Map(history.map((row) => [row.id, row]));
+
+  // Sessions the catalog attributes to this conversation (including ones
+  // archived by `/new` or a previous `/resume` switch). Rows whose transcript
+  // is gone are dropped — that is what a deleted session leaves behind. The
+  // catalog keeps one entry per (cwd, policy) pair, so the same thread can
+  // appear more than once; collapse those to a single row.
+  const chatRows: SessionRow[] = [];
+  if (ctx.sessionCatalog && identity) {
+    for (const entry of ctx.sessionCatalog.entries()) {
+      if (entry.scopeId !== identity.scopeId || entry.agentId !== agentKind) continue;
+      const id = agentKind === 'codex' ? entry.threadId : entry.sessionId;
+      if (!id) continue;
+      if (!onDisk.has(id) && id !== currentId) continue;
+      chatRows.push({
+        id,
+        preview: '',
+        updatedAt: entry.updatedAt,
+        ...(entry.lastSummary ? { summary: entry.lastSummary } : {}),
+      });
+    }
+    chatRows.sort((a, b) => b.updatedAt - a.updatedAt);
+    chatRows.splice(0, chatRows.length, ...dedupeSessionRows(chatRows));
+  }
+  const chatIds = new Set(chatRows.map((row) => row.id));
+  if (currentId && !chatIds.has(currentId)) {
+    chatRows.unshift({ id: currentId, preview: '', updatedAt: updatedAt ?? Date.now() });
+    chatIds.add(currentId);
+  }
+
+  const toEntry = (row: SessionRow): SessionOverviewEntry => {
+    const disk = onDisk.get(row.id);
+    const current = row.id === currentId;
+    const lastPreview = disk?.lastPreview ?? row.lastPreview;
+    return {
+      preview: disk?.preview || row.summary || `会话 ${row.id.slice(0, 8)}…`,
+      ...(lastPreview ? { lastPreview } : {}),
+      displayId: `${row.id.slice(0, 8)}…`,
+      relTime: formatRelTime(disk?.updatedAt ?? row.updatedAt),
+      ...(disk?.detail ? { detail: disk.detail } : {}),
+      ...(current ? { current: true } : {}),
+      ...(current
+        ? {}
+        : identity
+          ? {
+              resumeArg:
+                agentKind === 'codex'
+                  ? issueResumeCandidate(identity, { threadId: row.id })
+                  : issueResumeCandidate(identity, { sessionId: row.id }),
+            }
+          : agentKind === 'claude'
+            ? { resumeArg: row.id }
+            : {}),
+    };
+  };
+
+  const currentFirst = chatRows
+    .slice()
+    .sort((a, b) => Number(b.id === currentId) - Number(a.id === currentId));
+  const otherRows = history.filter((row) => !chatIds.has(row.id)).slice(0, limit);
+
+  const card = sessionsCard(
+    {
+      ...(currentId ? { sessionId: currentId } : {}),
+      ...(updatedAt ? { relTime: formatRelTime(updatedAt) } : {}),
+      ...(stored?.idleTimeoutMinutes !== undefined
+        ? { idleTimeoutMinutes: stored.idleTimeoutMinutes }
+        : {}),
+    },
+    cwd,
+    [
+      { title: '这个聊天', entries: currentFirst.slice(0, 5).map(toEntry) },
+      { title: '其它来源', entries: otherRows.map(toEntry) },
+    ],
+  );
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+}
+
+/** A resumable session reduced to what the `/sessions` card shows. */
+interface SessionRow {
+  id: string;
+  preview: string;
+  updatedAt: number;
+  detail?: string;
+  summary?: string;
+  lastPreview?: string;
+}
+
+/** Keep the first row per session id, preserving order. */
+function dedupeSessionRows(rows: SessionRow[]): SessionRow[] {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (seen.has(row.id)) return false;
+    seen.add(row.id);
+    return true;
+  });
+}
+
+/**
+ * `/sessions rm <id prefix>` — delete one of this cwd's session transcripts.
+ * The ID comes from the `/sessions` card. Deleting a transcript is permanent,
+ * so the prefix has to identify exactly one session, and the conversation's
+ * own session is refused (switch away with `/new` first).
+ */
+async function removeSession(prefix: string, ctx: CommandContext, cwd: string): Promise<void> {
+  if (ctx.controls.profileConfig.agentKind === 'codex') {
+    await reply(ctx, 'Codex 会话要在 Codex CLI 里管理，这里暂不支持删除。');
+    return;
+  }
+  const query = prefix.trim().replace(/…$/, '');
+  if (!/^[A-Za-z0-9-]{4,64}$/.test(query)) {
+    await reply(ctx, '用法：`/sessions rm <会话 ID 前缀>`，ID 见 `/sessions` 每行第三段。');
+    return;
+  }
+
+  const sessions = await listClaudeResumeHistory(ctx, cwd, 50);
+  const matches = sessions.filter((s) => s.sessionId.startsWith(query));
+  if (matches.length === 0) {
+    await reply(ctx, `没有找到 ID 以 \`${query}\` 开头的会话。`);
+    return;
+  }
+  if (matches.length > 1) {
+    await reply(ctx, `有 ${matches.length} 个会话以 \`${query}\` 开头，请再多输入几位 ID。`);
+    return;
+  }
+  const target = matches[0]!;
+  if (target.sessionId === ctx.sessions.getRaw(ctx.scope)?.sessionId) {
+    await reply(ctx, '这是当前正在使用的会话，先 `/new` 开新会话，再删除它。');
+    return;
+  }
+
+  let deleted: boolean;
+  try {
+    deleted = await deleteSessionFile(cwd, target.sessionId);
+  } catch (err) {
+    log.fail('command', err, { cmd: '/sessions rm' });
+    await reply(ctx, '删除失败：读取会话文件时出错。');
+    return;
+  }
+  if (!deleted) {
+    await reply(ctx, '删除失败：会话文件已经不在了。');
+    return;
+  }
+  forgetCatalogSession(ctx.sessionCatalog, target.sessionId);
+  await reply(
+    ctx,
+    `🗑 已删除会话 \`${target.sessionId.slice(0, 8)}…\`（${target.preview}），不可恢复。`,
+  );
+}
+
+/** Drop catalog rows that point at a transcript we just deleted. */
+function forgetCatalogSession(catalog: SessionCatalog | undefined, sessionId: string): void {
+  if (!catalog) return;
+  for (const entry of catalog.entries()) {
+    if (entry.agentId === 'claude' && entry.sessionId === sessionId) {
+      catalog.remove(entry.key);
+    }
+  }
+}
+
 async function handleResume(args: string, ctx: CommandContext): Promise<void> {
   const parts = args.trim().split(/\s+/).filter(Boolean);
   const sub = parts[0] ?? '';
@@ -819,10 +1037,9 @@ async function handleModel(args: string, ctx: CommandContext): Promise<void> {
   const raw = args.trim().replace(/^use\s+/, '');
 
   if (!raw) {
-    await sendManagedCard(
-      ctx.channel,
+    await ctx.channel.send(
       ctx.msg.chatId,
-      modelCard(current, options),
+      { card: modelCard(current, options) },
       commandReplyOptions(ctx),
     );
     return;

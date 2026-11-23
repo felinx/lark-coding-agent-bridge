@@ -207,6 +207,132 @@ export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
   return shell('🔁 恢复历史会话', elements);
 }
 
+/** One row in the `/sessions` overview: a session the bridge can continue. */
+export interface SessionOverviewEntry {
+  preview: string;
+  /** The session's most recent message, when known. */
+  lastPreview?: string;
+  /** Short session id, so two similar-looking sessions stay distinguishable. */
+  displayId?: string;
+  relTime: string;
+  detail?: string;
+  current?: boolean;
+  /**
+   * Resume argument for the row's button. A one-time nonce from the resume
+   * candidate store — never a raw session id, so a forwarded card cannot
+   * resume someone else's session.
+   */
+  resumeArg?: string;
+}
+
+/** A titled group of rows — "这个聊天" vs. everything else on disk. */
+export interface SessionOverviewSection {
+  title: string;
+  entries: SessionOverviewEntry[];
+}
+
+/** The conversation's own session, as stored by the bridge. */
+export interface SessionOverview {
+  sessionId?: string;
+  relTime?: string;
+  idleTimeoutMinutes?: number;
+}
+
+/**
+ * `/sessions` overview: the sessions this conversation can continue, grouped
+ * by where they came from. Each row is one full-width text button, so the row
+ * itself is the thing you click — there is no separate restore button. Every
+ * resumable row's payload is a one-time nonce.
+ */
+export function sessionsCard(
+  overview: SessionOverview,
+  cwd: string,
+  sections: SessionOverviewSection[],
+): object {
+  const elements: object[] = [md(`\`${escapeCode(cwd)}\` 里的对话`)];
+
+  if (overview.sessionId) {
+    const meta = [
+      ...(overview.relTime ? [overview.relTime] : []),
+      ...(overview.idleTimeoutMinutes !== undefined
+        ? [
+            overview.idleTimeoutMinutes === 0
+              ? '探活关闭'
+              : `探活 ${overview.idleTimeoutMinutes} 分钟`,
+          ]
+        : []),
+    ];
+    elements.push(
+      md(
+        `当前会话 \`${escapeCode(overview.sessionId.slice(0, 8))}…\`${meta.length > 0 ? ` · ${meta.join(' · ')}` : ''}`,
+      ),
+    );
+  } else {
+    elements.push(md('当前会话：尚未建立（发一条消息后会创建）'));
+  }
+
+  const populated = sections.filter((section) => section.entries.length > 0);
+  if (populated.length === 0) {
+    elements.push(HR2);
+    elements.push(md('此目录下没有可列出的会话。'));
+  }
+  for (const section of populated) {
+    elements.push(HR2);
+    elements.push(md(`**${escapeMd(section.title)}**`));
+    section.entries.forEach((e, i) => {
+      const heading = `**${i + 1}. ${escapeMd(e.preview)}**${e.current ? ' · 当前使用中' : ''}`;
+      const facts = [
+        ...(e.displayId ? [`\`${escapeCode(e.displayId)}\``] : []),
+        escapeMd(e.relTime),
+        ...(e.detail ? [escapeMd(e.detail)] : []),
+      ].join(' · ');
+      // A button's text renders on one line — newlines collapse — so the
+      // clickable part is the title only and the details sit underneath it as
+      // regular markdown, where line breaks survive.
+      elements.push(
+        e.resumeArg && !e.current
+          ? rowButton(heading, { cmd: 'resume.use', arg: e.resumeArg })
+          : md(heading),
+      );
+      elements.push(
+        md([...(e.lastPreview ? [`最近：${escapeMd(e.lastPreview)}`] : []), facts].join('\n')),
+      );
+    });
+  }
+
+  elements.push(HR2);
+  elements.push(md('点一行，下一条消息接续该会话；`/new` 会回到自动派生的那个。'));
+  return shell2('📚 可接续的会话', elements);
+}
+
+/** Card JSON 2.0 shell. Container components reject `behaviors`, so the
+ * clickable unit has to be a full-width text button. */
+function shell2(title: string, elements: object[]): object {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'fill' },
+    header: { title: { tag: 'plain_text', content: title }, template: 'blue' },
+    body: { elements },
+  };
+}
+
+function md(content: string): object {
+  return { tag: 'markdown', content };
+}
+
+const HR2: object = { tag: 'hr' };
+
+/** One clickable row: borderless, full width, two lines of lark_md. */
+function rowButton(content: string, value: Record<string, unknown>): object {
+  return {
+    tag: 'button',
+    type: 'text',
+    width: 'fill',
+    text: { tag: 'lark_md', content },
+    behaviors: [{ type: 'callback', value }],
+  };
+}
+
 export function helpCard(agentName = 'Agent'): object {
   const escapedAgentName = escapeMd(agentName);
   return shell('💡 使用帮助', [
@@ -217,6 +343,8 @@ export function helpCard(agentName = 'Agent'): object {
         '- `/new` `/reset` — 清空当前 chat 的会话',
         '- `/new chat [name]` — 新建群+新会话，自动拉你进群',
         '- `/resume [N]` — 列出并恢复历史会话（最多 N 条）',
+        '- `/sessions [N]` — 列出可接续的会话，点一行即可接续',
+        '- `/sessions rm <id前缀>` — 删除一条历史会话（不可恢复）',
         '- `/cd <path>` — 切换工作目录（会重置 session）',
         '- `/ws list|save <name>|use <name>|remove <name>` — 工作目录',
         '- `/account` — 查看当前应用；`/account change` 换 appId/secret 并重连',

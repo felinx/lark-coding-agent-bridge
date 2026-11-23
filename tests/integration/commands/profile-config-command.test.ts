@@ -14,6 +14,7 @@ import {
 import { runtimeProfileConfig } from '../../../src/config/profile-store';
 import { getMessageReplyMode, getRequireMentionInGroup, secretKeyForApp } from '../../../src/config/schema';
 import { SessionStore } from '../../../src/session/store';
+import { SessionCatalog, type SessionCatalogIdentity } from '../../../src/session/catalog';
 import { WorkspaceStore } from '../../../src/workspace/store';
 import { FakeAgentAdapter } from '../../helpers/fake-agent';
 import { createFakeChannel } from '../../helpers/fake-channel';
@@ -126,6 +127,103 @@ describe('profile-aware account and config commands', () => {
       process.env.HOME = savedHome;
       await rm(fakeHome, { recursive: true, force: true });
     }
+  });
+
+  it('/sessions rm deletes exactly the matching transcript', async () => {
+    vi.useFakeTimers();
+    const fakeHome = await mkdtemp(join(tmpdir(), 'sessions-rm-home-'));
+    const savedHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const h = await createHarness();
+      const encoded = h.workspace.replace(/[^A-Za-z0-9]/g, '-');
+      const dir = join(fakeHome, '.claude', 'projects', encoded);
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, 'abcdef12-3456-7890-abcd-ef1234567890.jsonl');
+      await writeFile(
+        file,
+        `${JSON.stringify({ type: 'user', message: { content: '旧会话' } })}\n`,
+        'utf8',
+      );
+
+      await h.command('/sessions rm abcdef12');
+      expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('已删除');
+      await expect(readFile(file)).rejects.toThrow();
+
+      // A missing id is reported, not deleted silently.
+      await h.command('/sessions rm deadbeef');
+      expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('没有找到');
+    } finally {
+      process.env.HOME = savedHome;
+      await rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it('/sessions collapses catalog rows that point at the same session', async () => {
+    vi.useFakeTimers();
+    const fakeHome = await mkdtemp(join(tmpdir(), 'sessions-dup-home-'));
+    const savedHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      // One chat can hold several catalog rows for the same session (one per
+      // cwd/policy pair after /cd). The card must still show it once.
+      const options: {
+        sessionCatalog?: SessionCatalog;
+        sessionCatalogIdentity?: SessionCatalogIdentity;
+      } = {};
+      const h = await createHarness(options);
+      const sessionId = 'dup00000-1111-2222-3333-444455556666';
+      const catalog = new SessionCatalog(join(h.rootDir, 'catalog.json'));
+      for (const [cwd, policy] of [
+        ['/repo-a', 'p1'],
+        ['/repo-b', 'p2'],
+      ]) {
+        catalog.upsertActive({
+          scopeId: 'chat-1',
+          agentId: 'claude',
+          cwdRealpath: cwd!,
+          policyFingerprint: policy!,
+          sessionId,
+        });
+      }
+      options.sessionCatalog = catalog;
+      options.sessionCatalogIdentity = {
+        scopeId: 'chat-1',
+        agentId: 'claude',
+        cwdRealpath: '/repo-a',
+        policyFingerprint: 'p1',
+      };
+
+      const encoded = h.workspace.replace(/[^A-Za-z0-9]/g, '-');
+      const dir = join(fakeHome, '.claude', 'projects', encoded);
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, `${sessionId}.jsonl`),
+        `${JSON.stringify({ type: 'user', message: { content: '重复会话' } })}\n`,
+        'utf8',
+      );
+
+      await h.command('/sessions');
+      const card = JSON.stringify(h.channel.sent.at(-1)?.content);
+      expect(card).toContain('重复会话');
+      expect(card.match(/dup00000/g)).toHaveLength(1);
+    } finally {
+      process.env.HOME = savedHome;
+      await rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it('/sessions shows the current session under "这个聊天"', async () => {
+    vi.useFakeTimers();
+    const h = await createHarness();
+    h.sessions.set('chat-1', 'abcdef12-3456-7890-abcd-ef1234567890', h.workspace);
+
+    await h.command('/sessions');
+    const card = JSON.stringify(h.channel.sent.at(-1)?.content);
+    expect(card).toContain('可接续的会话');
+    expect(card).toContain('这个聊天');
+    expect(card).toContain('abcdef12');
+    expect(card).toContain('当前使用中');
   });
 
   it('/model sends the picker card and "/model use <id>" persists the choice', async () => {
@@ -292,9 +390,13 @@ describe('profile-aware account and config commands', () => {
 
 async function createHarness(options: {
   preferences?: RootConfig['profiles'][string]['preferences'];
+  sessionCatalog?: SessionCatalog;
+  sessionCatalogIdentity?: SessionCatalogIdentity;
 } = {}): Promise<{
   rootDir: string;
   channel: ReturnType<typeof createFakeChannel>;
+  sessions: SessionStore;
+  workspace: string;
   command(content: string, formValue?: Record<string, unknown>): Promise<boolean>;
 }> {
   const rootDir = await mkdtemp(join(tmpdir(), 'bridge-profile-config-command-'));
@@ -323,6 +425,8 @@ async function createHarness(options: {
   return {
     rootDir,
     channel,
+    sessions,
+    workspace,
     command: (content: string, formValue?: Record<string, unknown>) =>
       tryHandleCommand({
         channel: channel as unknown as CommandContext['channel'],
@@ -336,6 +440,10 @@ async function createHarness(options: {
         controls,
         formValue,
         fromCardAction: true,
+        ...(options.sessionCatalog ? { sessionCatalog: options.sessionCatalog } : {}),
+        ...(options.sessionCatalogIdentity
+          ? { sessionCatalogIdentity: options.sessionCatalogIdentity }
+          : {}),
       }),
   };
 }

@@ -136,6 +136,13 @@ export class SessionCatalog {
     return [...this.data.values()].map((entry) => ({ ...entry }));
   }
 
+  /** Forget one entry entirely — used when the session's transcript is deleted. */
+  remove(key: string): boolean {
+    if (!this.data.delete(key)) return false;
+    this.schedulePersist();
+    return true;
+  }
+
   gc(options: SessionCatalogGcOptions = {}): void {
     const now = options.now ?? Date.now();
     const maxArchivedAgeMs = options.maxArchivedAgeMs ?? DEFAULT_MAX_ARCHIVED_AGE_MS;

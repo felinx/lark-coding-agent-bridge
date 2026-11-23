@@ -185,13 +185,76 @@ describe('COT event mapping', () => {
     expect(publisher.degradedReason).toBe('field validation failed');
     expect(client.completed).toEqual([]);
   });
+
+  it('keeps every event under the server byte cap for long Chinese deltas', async () => {
+    const client = new FakeCotClient();
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-long',
+      scope: 'oc_chat',
+      inputPreview: 'run',
+    });
+    await publisher.start();
+
+    // 2000 CJK characters ≈ 6 KB — well past the per-event limit.
+    await consumeCotEvents(iterate([
+      { type: 'thinking', delta: '思'.repeat(2000) },
+      { type: 'text', delta: '答'.repeat(2000) },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'brief' });
+
+    expect(publisher.disabled).toBe(false);
+    const deltas = client.events
+      .filter((event) => event.event_type.endsWith('_CONTENT'))
+      .map((event) => JSON.parse(event.content) as { delta: string });
+    expect(deltas).toHaveLength(2);
+    for (const event of client.events) {
+      expect(Buffer.byteLength(event.content, 'utf8')).toBeLessThanOrEqual(1000);
+    }
+    for (const { delta } of deltas) {
+      expect(delta.endsWith('...')).toBe(true);
+      expect(delta.length).toBeLessThan(2000);
+    }
+  });
+
+  it('retries a batch the server rejects for size instead of disabling CoT', async () => {
+    const client = new FakeCotClient();
+    client.updateFailures.push(
+      new Error(
+        'COT API failed: code=10001 msg=Your request contains an invalid request parameter, ext=AppendCOTEvents: event[6] content too long',
+      ),
+    );
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-retry',
+      scope: 'oc_chat',
+      inputPreview: 'run',
+    });
+    await publisher.start();
+
+    await consumeCotEvents(iterate([
+      { type: 'text', delta: 'working' },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'brief' });
+
+    expect(publisher.disabled).toBe(false);
+    expect(client.completed).toEqual(['done']);
+    expect(client.updateCalls).toBeGreaterThan(1);
+  });
 });
 
 class FakeCotClient {
   events: Array<{ event_type: string; content: string; timestamp: number }> = [];
   completed: string[] = [];
   createCalls: Array<{ chatId: string; originMessageId?: string }> = [];
+  updateCalls = 0;
   failUpdate: Error | undefined;
+  /** One-shot update failures, consumed in order before `failUpdate` applies. */
+  updateFailures: Error[] = [];
   failCreate: Error | undefined;
   createResult: Record<string, unknown> | undefined;
 
@@ -202,6 +265,9 @@ class FakeCotClient {
   }
 
   async update(_ref: unknown, events: readonly { event_type: string; content: string; timestamp: number }[]): Promise<void> {
+    this.updateCalls += 1;
+    const oneShot = this.updateFailures.shift();
+    if (oneShot) throw oneShot;
     if (this.failUpdate) throw this.failUpdate;
     this.events.push(...events);
   }

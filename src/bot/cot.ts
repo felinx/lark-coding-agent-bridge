@@ -10,8 +10,15 @@ const ENDPOINTS: Record<TenantBrand, string> = {
 };
 
 const COT_UPDATE_THROTTLE_MS = 600;
-const COT_TOOL_OUTPUT_MAX = 1200;
-const COT_TEXT_MAX = 1200;
+// The CoT endpoint caps the *bytes* of each event's serialized `content`
+// (server answer: "AppendCOTEvents: event[N] content too long"). Chinese text
+// is three bytes per character, so a char-based cap of 1200 could still ship
+// ~3.6 KB and get the whole bubble disabled — keep a conservative byte budget
+// and shrink per event instead.
+const COT_TOOL_OUTPUT_MAX = 700;
+const COT_TEXT_MAX = 700;
+const COT_CONTENT_MAX_BYTES = 1000;
+const COT_RETRY_MAX_BYTES = 400;
 // Bounds every CoT HTTP call. Without it a hung message_cot endpoint pins
 // start() — which runs before any agent event is drained and before the
 // plain-reply fallback — to undici's ~300s default.
@@ -195,9 +202,14 @@ export class CotPublisher {
 
   enqueue(eventType: string, content: unknown): void {
     if (this.disabled || !this.ref) return;
+    const fitted = fitCotContent(content);
+    if (fitted === undefined) {
+      log.warn('cot', 'event-dropped', { eventType, reason: 'content-too-long' });
+      return;
+    }
     this.buffer.push({
       event_type: eventType,
-      content: JSON.stringify(content),
+      content: fitted,
       timestamp: Date.now(),
     });
     this.scheduleFlush();
@@ -235,7 +247,7 @@ export class CotPublisher {
     }
     const events = this.buffer.splice(0);
     if (events.length === 0) return;
-    this.flushing = this.client.update(this.ref, events)
+    this.flushing = this.send(events)
       .catch((err) => {
         this.disabled = true;
         this.degradedReason = err instanceof Error ? err.message : String(err);
@@ -246,6 +258,34 @@ export class CotPublisher {
         if (this.buffer.length > 0 && !this.disabled) this.scheduleFlush();
       });
     await this.flushing;
+  }
+
+  /**
+   * Push one batch. If the server rejects a batch for size, shrink every
+   * event and retry once before giving up on the bubble — a single oversized
+   * reasoning chunk should not cost the whole run its CoT stream.
+   */
+  private async send(events: CotEvent[]): Promise<void> {
+    if (!this.ref) return;
+    try {
+      await this.client.update(this.ref, events);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!/content too long/i.test(message)) throw err;
+      const shrunk = events.flatMap((event) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(event.content);
+        } catch {
+          return [];
+        }
+        const fitted = fitCotContent(parsed, COT_RETRY_MAX_BYTES);
+        return fitted === undefined ? [] : [{ ...event, content: fitted }];
+      });
+      if (shrunk.length === 0) throw err;
+      log.warn('cot', 'retry-shrunk', { dropped: events.length - shrunk.length });
+      await this.client.update(this.ref, shrunk);
+    }
   }
 }
 
@@ -420,9 +460,44 @@ function cotToolIcon(name: string): string {
   return 'default';
 }
 
-function truncateCot(value: unknown, max: number): string {
+/**
+ * Serialize one event's content, shrinking its text fields until it fits the
+ * server's byte cap. Returns undefined when even the trimmed payload is too
+ * large — the event is dropped rather than failing the whole batch.
+ */
+export function fitCotContent(content: unknown, maxBytes = COT_CONTENT_MAX_BYTES): string | undefined {
+  const json = JSON.stringify(content);
+  if (byteLength(json) <= maxBytes) return json;
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return undefined;
+  const fields = { ...(content as Record<string, unknown>) };
+  const textKeys = Object.keys(fields)
+    .filter((key) => typeof fields[key] === 'string')
+    .sort((a, b) => byteLength(fields[b] as string) - byteLength(fields[a] as string));
+  for (const key of textKeys) {
+    fields[key] = truncateCot(fields[key], Math.max(64, Math.floor(maxBytes / 4)));
+    const trimmed = JSON.stringify(fields);
+    if (byteLength(trimmed) <= maxBytes) return trimmed;
+  }
+  return undefined;
+}
+
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/** Truncate to a UTF-8 byte budget without splitting a surrogate pair. */
+function truncateCot(value: unknown, maxBytes: number): string {
   const text = String(value ?? '');
-  return text.length > max ? `${text.slice(0, max)}...` : text;
+  if (byteLength(text) <= maxBytes) return text;
+  let out = '';
+  let used = 0;
+  for (const char of text) {
+    const size = byteLength(char);
+    if (used + size > maxBytes - 3) break;
+    out += char;
+    used += size;
+  }
+  return `${out}...`;
 }
 
 function stringValue(value: unknown): string | undefined {

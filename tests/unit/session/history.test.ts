@@ -84,4 +84,60 @@ describe('Claude local session history', () => {
 
     expect(sessions[0]?.preview).toBe('真实用户问题 第二行');
   });
+
+  it('reports the first and the most recent message of a multi-turn session', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-history-home-'));
+    cleanup.push(home);
+    vi.doMock('node:os', async () => {
+      const actual = await vi.importActual<typeof import('node:os')>('node:os');
+      return { ...actual, homedir: () => home };
+    });
+    const { listRecentSessions } = await import('../../../src/session/history.js');
+
+    const cwd = '/repo';
+    const projectDir = join(home, '.claude', 'projects', '-repo');
+    await mkdir(projectDir, { recursive: true });
+    const lines = [
+      { type: 'user', message: { content: '第一句话' } },
+      { type: 'assistant', message: { content: [{ type: 'text', text: '第一轮回答' }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', content: 'ignored' }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't', name: 'Bash', input: {} }] } },
+      { type: 'user', message: { content: '最后一句话' } },
+      { type: 'assistant', message: { content: [{ type: 'text', text: '最后一轮回答' }] } },
+    ];
+    await writeFile(
+      join(projectDir, 'session-b.jsonl'),
+      `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`,
+      'utf8',
+    );
+
+    const sessions = await listRecentSessions(cwd, 5);
+
+    expect(sessions[0]).toMatchObject({
+      sessionId: 'session-b',
+      preview: '第一句话',
+      lastPreview: '最后一轮回答',
+    });
+  });
+
+  it('deletes a transcript by id and refuses ids that could escape the directory', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-history-home-'));
+    cleanup.push(home);
+    vi.doMock('node:os', async () => {
+      const actual = await vi.importActual<typeof import('node:os')>('node:os');
+      return { ...actual, homedir: () => home };
+    });
+    const history = await import('../../../src/session/history.js');
+
+    const cwd = '/repo';
+    const projectDir = join(home, '.claude', 'projects', '-repo');
+    await mkdir(projectDir, { recursive: true });
+    const file = join(projectDir, 'session-c.jsonl');
+    await writeFile(file, `${JSON.stringify({ type: 'user', message: { content: 'old' } })}\n`);
+
+    await expect(history.deleteSessionFile(cwd, '../../etc/passwd')).resolves.toBe(false);
+    await expect(history.deleteSessionFile(cwd, 'session-c')).resolves.toBe(true);
+    await expect(history.deleteSessionFile(cwd, 'session-c')).resolves.toBe(false);
+    await expect(history.listRecentSessions(cwd, 5)).resolves.toEqual([]);
+  });
 });
